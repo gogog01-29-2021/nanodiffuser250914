@@ -1,79 +1,112 @@
-"""
-Training script for nano diffusion models.
+"""Train a diffusion model from scratch.
 
-This script demonstrates a simple training loop for a tiny latent diffusion model. It shows how to
-initialize the UNet backbone, prepare a dummy dataset, and run optimization steps. For actual
-projects you would replace the random data with a real dataset and expand the loss computation.
-
-Usage:
-    python train_diffusion.py --epochs 5 --batch_size 32
-
+This script provides a skeleton for training a tiny diffusion model using the
+modules in this repository. It should be adapted with dataset loading,
+optimizer setup, and training loops.
 """
 
-import argparse
 import torch
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader
+from pathlib import Path
+from typing import Optional
 
-# Import tiny model components. These imports assume the repository structure:
-# nano_diffusion/models/...
-from models.unet_tiny import UNetTiny  # type: ignore
-from models.vae_tiny import VAETiny  # type: ignore
+try:
+    # Import torchvision components lazily; only needed if using a real dataset
+    from torchvision.datasets import ImageFolder  # type: ignore
+    from torchvision import transforms  # type: ignore
+except ImportError:
+    ImageFolder = None  # type: ignore
+    transforms = None  # type: ignore
 
+from models.unet_tiny import UNetTiny
+from models.vae_tiny import VAETiny
+from core.schedules import edm_sigma_schedule
+from core.losses import v_prediction_loss
 
-def parse_args() -> argparse.Namespace:
-    """Parse command line arguments for training hyperparameters."""
-    parser = argparse.ArgumentParser(description="Train a mini diffusion model")
-    parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size for DataLoader")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    return parser.parse_args()
+def train(
+    num_epochs: int = 1,
+    batch_size: int = 16,
+    dataset_dir: Optional[str] = None,
+    checkpoint_interval: int = 100,
+    checkpoint_dir: str = "checkpoints",
+) -> None:
+    """Train the diffusion model.
 
+    This function will attempt to load images from ``dataset_dir`` using
+    ``torchvision.datasets.ImageFolder`` if provided. Images are resized to
+    64×64 and converted to tensors. If ``dataset_dir`` is ``None`` or
+    ``torchvision`` is not installed, a synthetic dataset of random tensors is
+    used instead. The model weights are periodically saved to ``checkpoint_dir``
+    every ``checkpoint_interval`` steps.
 
-def create_dummy_dataloader(batch_size: int) -> DataLoader:
+    Args:
+        num_epochs: Number of full passes over the dataset.
+        batch_size: Number of samples per batch.
+        dataset_dir: Directory containing image data organized by class
+            subdirectories. If ``None``, uses a synthetic dataset.
+        checkpoint_interval: Number of training steps between checkpoint saves.
+        checkpoint_dir: Directory to save checkpoint files into.
     """
-    Create a dummy DataLoader that yields random latent vectors.
 
-    In practice you would load your real dataset here and encode it with the VAE.
-    """
-    # Generate random latent data (100 samples, 4 channels, 64x64 resolution)
-    data = torch.randn(100, 4, 64, 64)
-    dataset = TensorDataset(data)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    # Attempt to build a real dataset loader if dataset_dir is provided
+    if dataset_dir and ImageFolder is not None and transforms is not None:
+        transform = transforms.Compose(
+            [
+                transforms.Resize((64, 64)),
+                transforms.ToTensor(),
+            ]
+        )
+        dataset = ImageFolder(dataset_dir, transform=transform)
+    else:
+        # Fallback synthetic dataset: random tensors shaped like images
+        dataset = [torch.randn(3, 64, 64) for _ in range(100)]
 
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-def train_one_epoch(model: torch.nn.Module, dataloader: DataLoader,
-                    optimizer: torch.optim.Optimizer, device: torch.device) -> None:
-    """
-    Run a single training epoch over the DataLoader.
-    """
-    model.train()
-    for batch, in dataloader:
-        batch = batch.to(device)
-        optimizer.zero_grad()
-        # Forward pass through the model
-        output = model(batch, None, None)  # UNetTiny takes latent + timestep + cond; cond=None here
-        # Compute a dummy loss as MSE between input and output
-        loss = torch.nn.functional.mse_loss(output, batch)
-        loss.backward()
-        optimizer.step()
-
-
-
-def main() -> None:
-    args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    vae = VAETiny().to(device)
+    unet = UNetTiny().to(device)
+    optimizer = torch.optim.Adam(list(vae.parameters()) + list(unet.parameters()), lr=1e-3)
+    sigmas = edm_sigma_schedule(10)
 
-    # Initialize model and optimizer
-    model = UNetTiny().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    global_step = 0
+    for epoch in range(num_epochs):
+        for step, batch in enumerate(dataloader):
+            x = batch[0] if isinstance(batch, (list, tuple)) else batch  # for ImageFolder
+            x = x.to(device)
+            optimizer.zero_grad()
+            # Encode image to latent
+            mu, logvar = vae.encode(x)
+            z0 = vae.reparameterize(mu, logvar)
+            # Sample noise level (use first sigma for simplicity)
+            sigma = sigmas[0]
+            noise = torch.randn_like(z0) * sigma
+            zt = z0 + noise
+            # Dummy time embedding
+            t_emb = torch.zeros(z0.size(0), 1, 1, 1, device=device)
+            pred = unet(zt, t_emb)
+            loss = v_prediction_loss(pred, noise)
+            loss.backward()
+            optimizer.step()
 
-    # Prepare DataLoader (replace with encoded real dataset)
-    dataloader = create_dummy_dataloader(args.batch_size)
+            global_step += 1
+            # Save checkpoint periodically
+            if global_step % checkpoint_interval == 0:
+                # Ensure checkpoint directory exists
+                Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+                ckpt_path = Path(checkpoint_dir) / f"checkpoint_epoch{epoch+1}_step{global_step}.pt"
+                torch.save(
+                    {
+                        "unet": unet.state_dict(),
+                        "vae": vae.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "epoch": epoch,
+                        "step": global_step,
+                    },
+                    ckpt_path,
+                )
 
-    for epoch in range(args.epochs):
-        train_one_epoch(model, dataloader, optimizer, device)
-        print(f"Epoch {epoch + 1}/{args.epochs} completed")
-
+        print(f"Epoch {epoch+1}: loss={loss.item():.4f}")
 
 if __name__ == "__main__":
-    main()
+    train()
